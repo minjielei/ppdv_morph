@@ -14,7 +14,7 @@ def chunk_model2d(Xa,Xb,st_calc,nchunks,**kwargs):
         Xa_here = Xa[part,:,:]
         Xb_here = Xb[part,:,:]
         
-        s_cov_here = st_calc.scattering_cross_corr(Xa_here, Xb_here, normalization='P11')
+        s_cov_here = st_calc.scattering_cross_corr(Xa_here, Xb_here, normalization='P11', remove_edge=True)
 
         corr = s_cov_here['corr'].cpu().numpy()
         c00_summary = s_cov_here['c00_summary'].cpu().numpy()
