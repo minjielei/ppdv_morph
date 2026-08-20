@@ -47,8 +47,8 @@ class CrossScattering2d(Scattering2d):
         super().__init__(M, N, J, L, device, wavelets, filters_set, 
                 weight, precision, ref, ref_a, ref_b, l_oversampling, frequency_factor)
         self.edge_masks = self.get_edge_masks(M, N, J)
-        # if device=='gpu':
-        #     self.edge_masks = self.edge_masks.cuda()
+        if device=='gpu':
+            self.edge_masks = self.edge_masks.cuda()
         # ---------------------------------------------------------------------------
     #
     # scattering cov
@@ -576,6 +576,148 @@ class CrossScattering2d(Scattering2d):
         return {'corr':corr_combined, 'c00_summary': C00_summary, 'c11_summary': C11_summary,
                 'c00_reduced': C00_reduced, 'c11_reduced': C11_reduced}
     
+    # ---------------------------------------------------------------------------
+    #
+    # Two-field cross scattering cov map
+    #
+    # ---------------------------------------------------------------------------
+    def scattering_cross_corr_map(
+        self, data_a, data_b, if_large_batch=False, C11_criteria=None, normalization='P00'
+    ):
+        '''
+        Calculates the scattering correlations for a batch of images, including:
+        orig. x orig.:     
+                        P00 = <(I * psi)(I * psi)*> = L2(I * psi)^2
+        orig. x modulus:   
+                        C01 = <(I * psi2)(|I * psi1| * psi2)*> / factor
+            when normalization == 'P00', factor = L2(I * psi2) * L2(I * psi1)
+            when normalization == 'P11', factor = L2(I * psi2) * L2(|I * psi1| * psi2)
+        modulus x modulus: 
+                        C11_pre_norm = <(|I * psi1| * psi3)(|I * psi2| * psi3)>
+                        C11 = C11_pre_norm / factor
+            when normalization == 'P00', factor = L2(I * psi1) * L2(I * psi2)
+            when normalization == 'P11', factor = L2(|I * psi1| * psi3) * L2(|I * psi2| * psi3)
+        modulus x modulus (auto): 
+                        P11 = <(|I * psi1| * psi2)(|I * psi1| * psi2)*>
+        '''
+        if C11_criteria is None: C11_criteria = 'j2>=j1'
+            
+        M, N, J, L = self.M, self.N, self.J, self.L
+        N_image = data_a.shape[0]
+        filters_set = self.filters_set
+        weight = self.weight
+                
+        # convert numpy array input into torch tensors
+        if type(data_a) == np.ndarray:
+            data_a = torch.from_numpy(data_a)
+        if type(data_b) == np.ndarray:
+            data_b = torch.from_numpy(data_b)
+            
+        if self.device=='gpu':
+            data_a = data_a.cuda()
+            data_b = data_b.cuda()
+        # data_a = st.whiten(data_a)*weight
+        # data_b = st.whiten(data_b)*weight
+        data_a_f = torch.fft.fftn(data_a, dim=(-2,-1))
+        data_b_f = torch.fft.fftn(data_b, dim=(-2,-1))
+        
+        # initialize tensors for scattering coefficients
+        P00_a = torch.zeros((N_image,M,N), dtype=data_a.dtype)
+        P00_b = torch.zeros((N_image,M,N), dtype=data_a.dtype)
+        P11_a = torch.zeros((N_image,M,N), dtype=data_a.dtype)
+        P11_b = torch.zeros((N_image,M,N), dtype=data_a.dtype)
+        C00 = torch.zeros((N_image,M,N), dtype=data_a_f.dtype)
+        C11 = torch.zeros((N_image,M,N), dtype=data_a_f.dtype)
+        
+        # move torch tensors to gpu device, if required
+        if self.device=='gpu':
+            P00_a     = P00_a.cuda()
+            P00_b     = P00_b.cuda()
+            P11_a     = P11_a.cuda()
+            P11_b     = P11_b.cuda()
+            C00       = C00.cuda()       
+            C11       = C11.cuda()
+
+        # calculate scattering fields
+        I1_a_complex = torch.fft.ifftn(
+            data_a_f[:,None,None,:,:] * filters_set[None,:J,:,:,:], dim=(-2,-1)
+        )
+        I1_b_complex = torch.fft.ifftn(
+            data_b_f[:,None,None,:,:] * filters_set[None,:J,:,:,:], dim=(-2,-1)
+        )
+        I1_a = I1_a_complex.abs()
+        I1_b = I1_b_complex.abs()
+        I1_a_f = torch.fft.fftn(I1_a, dim=(-2,-1))
+        I1_b_f = torch.fft.fftn(I1_b, dim=(-2,-1))
+        
+        P00_a = (I1_a*torch.conj(I1_a))
+        P00_b = (I1_b*torch.conj(I1_b))
+
+        C00 = torch.fft.ifftn(
+                (data_a_f * torch.conj(data_b_f))[:,None,None,:,:] * filters_set[None,:J,:,:,:]**2
+            , dim=(-2,-1))
+
+        Pa = P00_a; Pb = P00_b
+        C00 = C00 / (Pa * Pb)**0.5
+        
+        # # calculate the covariance and correlations of the scattering fields
+        # # only use the low-k Fourier coefs when calculating large-j scattering coefs.
+        # for j2 in range(0,J):
+        #     dx2, dy2 = self.get_dxdy(j2)
+        #     I1_a_f_small = cut_high_k_off(I1_a_f, dx2, dy2)
+        #     I1_b_f_small = cut_high_k_off(I1_b_f, dx2, dy2)
+        #     wavelet_f2 = cut_high_k_off(filters_set[j2], dx2, dy2)
+        #     _, M2, N2 = wavelet_f2.shape
+        #     wavelet_f2_squared = wavelet_f2**2
+        #     edge_dx = min(4, int(2**j2*dx2*2/M))
+        #     edge_dy = min(4, int(2**j2*dy2*2/N))
+        #     # a normalization change due to the cutoff of frequency space
+        #     fft_factor = 1 /(M2*N2) * (M2*N2/M/N)**2
+        #     for j1 in range(0, j2+1):
+        #         if eval(C11_criteria):
+        #             if not if_large_batch:
+        #                 P11_a[:,j1,j2,:,:] = (
+        #                     I1_a_f_small[:,j1].view(N_image,L,1,M2,N2) * 
+        #                     torch.conj(I1_a_f_small[:,j1].view(N_image,L,1,M2,N2)) *
+        #                     wavelet_f2_squared.view(1,1,L,M2,N2)
+        #                 )
+        #                 P11_b[:,j1,j2,:,:] = (
+        #                     I1_b_f_small[:,j1].view(N_image,L,1,M2,N2) * 
+        #                     torch.conj(I1_b_f_small[:,j1].view(N_image,L,1,M2,N2)) *
+        #                     wavelet_f2_squared.view(1,1,L,M2,N2)
+        #                 )
+        #                 C11[:,j1,j2,:,:] = (
+        #                     I1_a_f_small[:,j1].view(N_image,L,1,M2,N2) * 
+        #                     torch.conj(I1_b_f_small[:,j1].view(N_image,L,1,M2,N2)) *
+        #                     wavelet_f2_squared.view(1,1,L,M2,N2)
+        #                 )
+        #             else:
+        #                 for l1 in range(L):
+        #                 # [N_image,l2,l3,x,y]
+        #                     P11_a[:,j1,j2,l1,:] = (
+        #                         I1_a_f_small[:,j1,l1].view(N_image,1,M2,N2) * 
+        #                         torch.conj(I1_a_f_small[:,j1,l1].view(N_image,1,M2,N2)) *
+        #                         wavelet_f2_squared.view(1,L,M2,N2)
+        #                     )
+        #                     P11_b[:,j1,j2,l1,:] = (
+        #                         I1_b_f_small[:,j1,l1].view(N_image,1,M2,N2) * 
+        #                         torch.conj(I1_b_f_small[:,j1,l1].view(N_image,1,M2,N2)) *
+        #                         wavelet_f2_squared.view(1,L,M2,N2)
+        #                     )
+        #                     C11[:,j1,j2,l1,:] = (
+        #                         I1_a_f_small[:,j1,l1].view(N_image,1,M2,N2) * 
+        #                         torch.conj(I1_b_f_small[:,j1,l1].view(N_image,1,M2,N2)) *
+        #                         wavelet_f2_squared.view(1,L,M2,N2)
+        #                     )
+        # # normalizing C11
+        # if normalization=='P00':
+        #     Pa = P00_a; Pb = P00_b
+        # if normalization=='P11':
+        #     Pa = P11_a; Pb = P11_b
+        # C11 = C11 / (Pa * Pb)**0.5
+
+        return {'P00_a':P00_a.cpu().detach().numpy(), 'P00_b':P00_b.cpu().detach().numpy(), 'P11_a':P11_a.cpu().detach().numpy(), 'P11_b':P11_b.cpu().detach().numpy(), 'C00':C00.cpu().detach().numpy(), 'C11':C11.cpu().detach().numpy(), 'mask': self.edge_masks.cpu().detach().numpy()}
+
     def get_edge_masks(self,M, N, J, d0=1):
         edge_masks = torch.empty((J, M, N))
         X, Y = torch.meshgrid(torch.arange(M), torch.arange(N), indexing='ij')
